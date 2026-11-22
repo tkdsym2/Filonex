@@ -663,7 +663,7 @@ Multi-select: Shift+click toggles, Shift+drag draws selection box (SelectionMode
 
 - **Asset protocol**: Enabled with scope `["**/*"]` for image/PDF file access via `convertFileSrc()`
 - **CSP**: Set to `null` (permissive, required for asset:// protocol)
-- **Dev**: `npm run tauri dev` (frontend at localhost:1420)
+- **Dev**: `npm run tauri dev` (frontend at localhost:1430)
 - **Build**: `npm run tauri build`
 - **Window**: 1440x900 default, resizable. Auxiliary windows `agent-console` + `manual` are scoped by `capabilities/auxiliary-windows.json` (grants `core:window` set-title/focus/close/destroy + `store:default`).
 - **Auto-update**: `tauri-plugin-updater` (+ `tauri-plugin-process` for relaunch); `createUpdaterArtifacts: true` and signing required for `tauri build` to emit update artifacts.
