@@ -27,7 +27,7 @@
 ### Development Commands
 
 ```bash
-npm run tauri dev          # Dev server (frontend at localhost:1420)
+npm run tauri dev          # Dev server (frontend at localhost:1430)
 source "$HOME/.cargo/env"  # Rust env setup (if needed)
 npx tsc --noEmit           # Frontend type-check only (fast)
 cd src-tauri && cargo check # Rust compilation check only
@@ -1120,7 +1120,7 @@ Close Tab (Cmd+W) has special handling: if a detached window is focused, closes 
 | Window size | 1200 x 800, resizable |
 | CSP | null (permissive, required for asset:// protocol) |
 | Asset protocol | Enabled, scope `["**/*"]` |
-| Dev URL | `http://localhost:1420` |
+| Dev URL | `http://localhost:1430` |
 
 ---
 

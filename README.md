@@ -44,7 +44,7 @@ scripts/build-llama.sh
 npm run tauri dev
 ```
 
-The app launches at `http://localhost:1420` inside a Tauri WebView window.
+The app launches at `http://localhost:1430` inside a Tauri WebView window.
 
 ## Development
 

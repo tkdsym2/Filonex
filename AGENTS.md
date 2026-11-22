@@ -537,7 +537,7 @@ Multi-select: Shift+click toggles, Shift+drag draws selection box (SelectionMode
 
 - **Asset protocol**: Enabled with scope `["**/*"]` for image/PDF file access via `convertFileSrc()`
 - **CSP**: Set to `null` (permissive, required for asset:// protocol)
-- **Dev**: `npm run tauri dev` (frontend at localhost:1420)
+- **Dev**: `npm run tauri dev` (frontend at localhost:1430)
 - **Build**: `npm run tauri build`
 - **Window**: 1200x800 default, resizable
 
