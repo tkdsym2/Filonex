@@ -624,7 +624,11 @@ export interface RenderPreviewResult {
   /** Absolute PNG file paths for each rendered page (use convertFileSrc to display). */
   pages: string[];
   page_count: number;
+  /** Absolute per-page SVG paths (vector, same order as `pages`). */
+  svg_pages: string[];
   note_count: number;
+  /** Fingerprint of the render inputs; same inputs → same value (cache-buster). */
+  revision: string;
 }
 
 // ─── Translate Node ───

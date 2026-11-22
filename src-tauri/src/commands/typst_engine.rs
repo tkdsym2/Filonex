@@ -70,6 +70,7 @@ pub fn compile_to_pdf(source: String, image_root: Option<&Path>) -> Result<Vec<u
 /// Compile a Typst source string and render each page to a PNG image.
 ///
 /// `pixel_per_pt` controls resolution (e.g. 2.0 ≈ 144 dpi for crisp previews).
+#[cfg(test)]
 pub fn compile_to_pngs(
     source: String,
     image_root: Option<&Path>,
@@ -81,6 +82,30 @@ pub fn compile_to_pngs(
         let pixmap = typst_render::render(page, pixel_per_pt);
         let png = pixmap.encode_png().map_err(|e| e.to_string())?;
         pages.push(png);
+    }
+    Ok(pages)
+}
+
+/// One rendered preview page: a PNG (thumbnail / fallback) and a vector SVG
+/// (stays sharp at any zoom level in the viewer).
+pub struct PreviewPage {
+    pub png: Vec<u8>,
+    pub svg: String,
+}
+
+/// Compile once and produce both a PNG and an SVG for every page.
+pub fn compile_to_previews(
+    source: String,
+    image_root: Option<&Path>,
+    pixel_per_pt: f32,
+) -> Result<Vec<PreviewPage>, String> {
+    let doc = compile_doc(source, image_root)?;
+    let mut pages = Vec::with_capacity(doc.pages.len());
+    for page in &doc.pages {
+        let png = typst_render::render(page, pixel_per_pt)
+            .encode_png()
+            .map_err(|e| e.to_string())?;
+        pages.push(PreviewPage { png, svg: typst_svg::svg(page) });
     }
     Ok(pages)
 }

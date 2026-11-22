@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { NodeResizer, type NodeProps, type Node } from "@xyflow/react";
 import { NodePorts } from "./NodePorts";
 import PreviewIcon from "@mui/icons-material/Preview";
@@ -7,6 +7,38 @@ import { useGraphStore } from "../../store/graphStore";
 import { useRenderStore, EMPTY_RENDER_STATE, type RenderStatus } from "../../store/renderStore";
 import { useConnectedDisplayIds } from "./useConnectedDisplayIds";
 import { useT, type Entry } from "../../lib/i18n";
+import { requestRender } from "../../lib/renderRunner";
+
+/** Wait this long after the last input change before re-rendering. */
+const AUTO_RENDER_DEBOUNCE_MS = 1000;
+
+type GraphState = ReturnType<typeof useGraphStore.getState>;
+
+/**
+ * Everything on the canvas that changes this render's output: the connected
+ * Notes (content + reading order, which follows their position) and the render
+ * node's own settings. Other referenced nodes (papers, images, tables) are
+ * fingerprinted by the backend cache on each run.
+ */
+function renderInputSignature(s: GraphState, renderId: string): string {
+  const connected = new Set<string>();
+  for (const e of s.edges) {
+    if (e.source === renderId) connected.add(e.target);
+    if (e.target === renderId) connected.add(e.source);
+  }
+  const parts: string[] = [];
+  for (const n of s.nodes) {
+    if (n.id === renderId) {
+      parts.push(`self:${String(n.data?.metadata ?? "")}`);
+      continue;
+    }
+    if (!connected.has(n.id) || n.data?.node_type !== "user_doc") continue;
+    parts.push(
+      `${n.id}@${Math.round(n.position.y)},${Math.round(n.position.x)}:${String(n.data?.content ?? "")}`,
+    );
+  }
+  return parts.join("\u0000");
+}
 
 const ACCENT = "#9333ea";
 
@@ -29,7 +61,22 @@ export function RenderNode({ id, data, selected }: NodeProps<Node<RenderNodeData
   const updateNodeSize = useGraphStore((s) => s.updateNodeSize);
   const render = useRenderStore((s) => s.byNode[id]) ?? EMPTY_RENDER_STATE;
   const connectedRefs = useConnectedDisplayIds(id);
+  const inputSignature = useGraphStore((s) => renderInputSignature(s, id));
   const t = useT();
+
+  // Keep the preview live: render as soon as the node appears on the canvas
+  // (e.g. when a template opens), then again shortly after its inputs change.
+  const firstRun = useRef(true);
+  useEffect(() => {
+    const isFirst = firstRun.current;
+    firstRun.current = false;
+    if (isFirst && useRenderStore.getState().get(id).status === "idle") {
+      void requestRender(id);
+      return;
+    }
+    const timer = setTimeout(() => void requestRender(id), AUTO_RENDER_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [id, inputSignature]);
 
   const handleResizeEnd = useCallback(
     (_event: unknown, params: { x: number; y: number; width: number; height: number }) => {
@@ -80,7 +127,11 @@ export function RenderNode({ id, data, selected }: NodeProps<Node<RenderNodeData
 
         <div style={previewWrapStyle}>
           {firstPage ? (
-            <img src={convertFileSrc(firstPage)} alt="preview" style={thumbStyle} />
+            <img
+              src={`${convertFileSrc(firstPage)}?v=${render.revision}`}
+              alt="preview"
+              style={thumbStyle}
+            />
           ) : (
             <div
               style={{
@@ -93,8 +144,8 @@ export function RenderNode({ id, data, selected }: NodeProps<Node<RenderNodeData
                 : render.status === "rendering"
                   ? t({ en: "Rendering preview…", ja: "プレビュー生成中…" })
                   : t({
-                      en: "Connect Note nodes and open this node to render a PDF preview.",
-                      ja: "ノートを接続し、このノードを開くとPDFプレビューを生成します。",
+                      en: "Connect Note nodes to render a PDF preview.",
+                      ja: "ノートを接続するとPDFプレビューを生成します。",
                     })}
             </div>
           )}

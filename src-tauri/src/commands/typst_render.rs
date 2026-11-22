@@ -6,14 +6,16 @@
 //! compile time, so authors keep Content Pull / @Mention and the paper/image/
 //! table node integration while writing in Typst.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
 use rusqlite::Connection;
 use typst::syntax::{parse, LinkedNode, SyntaxKind};
 use serde::Serialize;
-use tauri::State;
+use tauri::Manager;
 
 use crate::db::Database;
 use super::nodes::{node_from_row, NodeData, NODE_COLUMNS};
@@ -29,13 +31,19 @@ const PREAMBLE: &str = "#set text(font: (\"Liberation Serif\", \"Noto Serif JP\"
 #set page(paper: \"a4\", margin: 2cm)\n\
 #set par(justify: true)\n\n";
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct RenderPreviewResult {
     /// Absolute file paths to per-page PNG previews (use convertFileSrc to show).
     pub pages: Vec<String>,
     pub page_count: usize,
+    /// Absolute file paths to per-page SVGs (vector; same order as `pages`).
+    pub svg_pages: Vec<String>,
     /// Number of connected Note nodes that fed this render.
     pub note_count: usize,
+    /// Fingerprint of the render inputs. Unchanged inputs give the same value,
+    /// so the frontend can use it as an image cache-buster without reloading
+    /// pages that did not change.
+    pub revision: String,
 }
 
 /// Escape text coming from data (node titles, table cell values) so it is shown
@@ -284,59 +292,187 @@ fn citation_style_of(node: &NodeData) -> String {
         .unwrap_or_else(|| "ieee".to_string())
 }
 
+/// Last successful preview per render node, keyed by an input fingerprint so a
+/// re-open (e.g. the detached window, or a layer switch) returns instantly when
+/// nothing changed.
+struct CachedRender {
+    key: u64,
+    result: RenderPreviewResult,
+}
+
+static RENDER_CACHE: LazyLock<Mutex<HashMap<String, CachedRender>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// One lock per render node: two windows rendering the same node would
+/// otherwise wipe/overwrite the same work dir concurrently. The second caller
+/// waits and then usually hits the cache.
+static RENDER_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn render_lock(node_id: &str) -> Arc<Mutex<()>> {
+    let mut locks = RENDER_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(node_id.to_string()).or_default().clone()
+}
+
+/// Fingerprint everything the assembled source depends on: citation style,
+/// the ordered Notes, every active node that a reference could resolve to
+/// (papers, images, tables, ...) and the image files on disk.
+fn render_inputs_key(
+    conn: &Connection,
+    citation_style: &str,
+    notes: &[NodeData],
+    all_nodes: &[NodeData],
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    citation_style.hash(&mut h);
+    for n in notes {
+        n.id.hash(&mut h);
+        n.content.hash(&mut h);
+    }
+    let mut others: Vec<&NodeData> = all_nodes.iter().collect();
+    others.sort_by(|a, b| a.id.cmp(&b.id));
+    for n in others {
+        n.id.hash(&mut h);
+        n.node_type.hash(&mut h);
+        n.display_id.hash(&mut h);
+        n.title.hash(&mut h);
+        n.content.hash(&mut h);
+        n.bibtex.hash(&mut h);
+        n.metadata.hash(&mut h);
+        if n.node_type == "image" {
+            let fp: Option<String> = conn
+                .query_row(
+                    "SELECT file_path FROM node_images WHERE node_id = ?1 LIMIT 1",
+                    [&n.id],
+                    |row| row.get(0),
+                )
+                .ok();
+            fp.hash(&mut h);
+            if let Some(meta) = fp.as_ref().and_then(|p| std::fs::metadata(p).ok()) {
+                meta.len().hash(&mut h);
+                meta.modified().ok().hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
 /// Compile the connected Notes of a render node into per-page PNG previews.
+///
+/// Async + `spawn_blocking`: a synchronous command runs on the main thread,
+/// and the Typst compile (seconds in debug builds) would freeze every window
+/// — including one that is just being opened.
 #[tauri::command]
-pub fn render_typst_preview(
-    db: State<Database>,
+pub async fn render_typst_preview(
+    app: tauri::AppHandle,
     render_node_id: String,
 ) -> Result<RenderPreviewResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.state::<Database>();
+        render_preview_blocking(&db, &render_node_id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn render_preview_blocking(db: &Database, render_node_id: &str) -> Result<RenderPreviewResult, String> {
+    let node_lock = render_lock(render_node_id);
+    let _guard = node_lock.lock().unwrap_or_else(|e| e.into_inner());
+
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
 
     let query = format!("SELECT {NODE_COLUMNS} FROM nodes WHERE id = ?1");
     let render_node: NodeData = conn
-        .query_row(&query, [&render_node_id], node_from_row)
+        .query_row(&query, [render_node_id], node_from_row)
         .map_err(|e| format!("Render node not found: {e}"))?;
     if render_node.node_type != "render" {
         return Err("Node is not a render node".to_string());
     }
 
     let citation_style = citation_style_of(&render_node);
-    let notes = connected_notes(&conn, &render_node_id)?;
+    let notes = connected_notes(&conn, render_node_id)?;
     let note_count = notes.len();
 
-    // Fresh work dir per render node (cleared each run to drop stale pages).
     let work_dir = std::env::temp_dir()
         .join("filonex-render")
-        .join(safe_filename(&render_node_id));
-    let _ = std::fs::remove_dir_all(&work_dir);
-    std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+        .join(safe_filename(render_node_id));
 
     if notes.is_empty() {
-        return Ok(RenderPreviewResult { pages: vec![], page_count: 0, note_count: 0 });
+        RENDER_CACHE.lock().unwrap_or_else(|e| e.into_inner()).remove(render_node_id);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return Ok(RenderPreviewResult {
+            pages: vec![],
+            page_count: 0,
+            svg_pages: vec![],
+            note_count: 0,
+            revision: String::new(),
+        });
     }
 
     let all_nodes = all_active_nodes(&conn, &render_node.layer_id)?;
+    let key = render_inputs_key(&conn, &citation_style, &notes, &all_nodes);
+    if let Some(hit) = RENDER_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(render_node_id) {
+        let files_exist = hit.result.pages.iter().chain(&hit.result.svg_pages).all(|p| Path::new(p).exists());
+        if hit.key == key && files_exist {
+            return Ok(hit.result.clone());
+        }
+    }
+
+    // Fresh work dir per render (cleared each run to drop stale pages/images).
+    let _ = std::fs::remove_dir_all(&work_dir);
+    std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+
     let source = assemble_typst_source(&conn, &all_nodes, &notes, &work_dir, &citation_style)?;
     drop(conn); // release the DB lock before the (heavier) Typst compile
 
-    let pngs = typst_engine::compile_to_pngs(source, Some(&work_dir), PREVIEW_PIXEL_PER_PT)?;
-    let mut pages = Vec::with_capacity(pngs.len());
-    for (i, png) in pngs.iter().enumerate() {
-        let path = work_dir.join(format!("page_{i:03}.png"));
-        std::fs::write(&path, png).map_err(|e| e.to_string())?;
-        pages.push(path.to_string_lossy().into_owned());
+    let rendered = typst_engine::compile_to_previews(source, Some(&work_dir), PREVIEW_PIXEL_PER_PT)?;
+    let mut pages = Vec::with_capacity(rendered.len());
+    let mut svg_pages = Vec::with_capacity(rendered.len());
+    for (i, page) in rendered.iter().enumerate() {
+        let png_path = work_dir.join(format!("page_{i:03}.png"));
+        std::fs::write(&png_path, &page.png).map_err(|e| e.to_string())?;
+        pages.push(png_path.to_string_lossy().into_owned());
+        let svg_path = work_dir.join(format!("page_{i:03}.svg"));
+        std::fs::write(&svg_path, &page.svg).map_err(|e| e.to_string())?;
+        svg_pages.push(svg_path.to_string_lossy().into_owned());
     }
 
-    Ok(RenderPreviewResult { page_count: pages.len(), pages, note_count })
+    let result = RenderPreviewResult {
+        page_count: pages.len(),
+        pages,
+        svg_pages,
+        note_count,
+        revision: format!("{key:016x}"),
+    };
+    RENDER_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(render_node_id.to_string(), CachedRender { key, result: result.clone() });
+    Ok(result)
 }
 
 /// Generate a final PDF from an export node connected to one or more render
 /// nodes. Notes from all connected render nodes are gathered (ordered, dedup'd),
 /// assembled into one Typst document, and compiled to `output_path`.
 #[tauri::command]
-pub fn generate_typst_export_pdf(
-    db: State<Database>,
+pub async fn generate_typst_export_pdf(
+    app: tauri::AppHandle,
     window: tauri::Window,
+    export_node_id: String,
+    output_path: Option<String>,
+) -> Result<String, String> {
+    // Off the main thread for the same reason as `render_typst_preview`.
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.state::<Database>();
+        export_pdf_blocking(&db, &window, export_node_id, output_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn export_pdf_blocking(
+    db: &Database,
+    window: &tauri::Window,
     export_node_id: String,
     output_path: Option<String>,
 ) -> Result<String, String> {
