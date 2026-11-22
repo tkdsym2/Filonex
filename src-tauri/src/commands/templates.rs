@@ -363,6 +363,50 @@ mod tests {
     }
 
     #[test]
+    fn render_preview_cache_hits_and_invalidates() {
+        let db = crate::db::Database::new().unwrap();
+        let assets = std::env::temp_dir().join(format!("filonex-template-assets-{}", uuid::Uuid::new_v4()));
+        let render_id: String = {
+            let conn = db.conn.lock().unwrap();
+            build_template(&conn, "chi-uist-sample", &assets).unwrap();
+            conn.query_row("SELECT id FROM nodes WHERE node_type = 'render'", [], |r| r.get(0)).unwrap()
+        };
+
+        let t = std::time::Instant::now();
+        let first = typst_render::render_preview_blocking(&db, &render_id).unwrap();
+        let cold = t.elapsed();
+        assert_eq!(first.page_count, 2);
+
+        let t = std::time::Instant::now();
+        let second = typst_render::render_preview_blocking(&db, &render_id).unwrap();
+        let warm = t.elapsed();
+        eprintln!("render preview: cold {cold:?}, cached {warm:?}");
+        assert_eq!(second.revision, first.revision, "unchanged inputs must hit the cache");
+        assert!(warm * 10 < cold, "cache hit should be near-instant (cold {cold:?}, warm {warm:?})");
+
+        // Concurrent renders of the same node are serialized and agree.
+        let results: Vec<_> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..3).map(|_| s.spawn(|| typst_render::render_preview_blocking(&db, &render_id).unwrap())).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(results.iter().all(|r| r.revision == first.revision && r.page_count == 2));
+
+        // Editing a connected note invalidates it.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE nodes SET content = content || '\n\nExtra.' WHERE display_id = 'note_2'", [])
+            .unwrap();
+        let third = typst_render::render_preview_blocking(&db, &render_id).unwrap();
+        assert_ne!(third.revision, first.revision);
+        assert!(third.pages.iter().chain(&third.svg_pages).all(|p| Path::new(p).exists()));
+        assert_eq!(third.svg_pages.len(), third.page_count);
+        let svg = std::fs::read_to_string(&third.svg_pages[0]).unwrap();
+        assert!(svg.starts_with("<svg") && svg.len() > 1000, "page SVG should be a real vector page");
+        let _ = std::fs::remove_dir_all(assets);
+    }
+
+    #[test]
     fn blank_templates_compile() {
         for id in ["acm-double", "acm-single"] {
             let (conn, assets) = build(id);

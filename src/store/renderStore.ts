@@ -13,17 +13,23 @@ export interface RenderState {
   /** Absolute file paths to rendered page PNGs (use convertFileSrc to display). */
   pages: string[];
   pageCount: number;
+  /** Absolute file paths to rendered page SVGs (vector; sharp at any zoom). */
+  svgPages: string[];
   error: string | null;
   /** Epoch ms of the last successful render (for cache/debounce decisions). */
   renderedAt: number | null;
+  /** Backend input fingerprint of the shown pages (image cache-buster). */
+  revision: string;
 }
 
 export const EMPTY_RENDER_STATE: RenderState = {
   status: "idle",
   pages: [],
   pageCount: 0,
+  svgPages: [],
   error: null,
   renderedAt: null,
+  revision: "",
 };
 
 interface RenderStore {
